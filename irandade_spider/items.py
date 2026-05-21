@@ -7,6 +7,7 @@ class PageItem(scrapy.Item):
     content_type = scrapy.Field()
     depth = scrapy.Field()
     referer = scrapy.Field()
+    status = scrapy.Field()
     response_headers = scrapy.Field()
 
 

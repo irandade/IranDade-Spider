@@ -6,13 +6,13 @@ Scrapy-based spider CLI that crawls websites, discovers PDF/XLSX files, download
 
 ```bash
 uv sync
-uv run spider crawl https://example.com --depth 3 --output-dir /data/downloads --rate-limit 2
+uv run spider https://example.com --depth 3 --output-dir /data/downloads --rate-limit 2
 ```
 
 ## Tech Stack
 - **Python 3.14+** with `.venv` (uv-managed)
 - **Scrapy** for crawling
-- **Typer** for CLI
+- **Click** for CLI
 - **Pydantic/Pydantic-Settings** for config & models
 
 ## Project Structure
@@ -25,7 +25,7 @@ irandade_spider/
 ├── middlewares.py    # RandomUA, RandomDelay, Resume middlewares
 ├── pipelines.py      # PagePipeline, FilePipeline, StatePipeline
 ├── settings.py       # Scrapy settings defaults
-├── main.py           # Typer CLI entry (spider crawl command)
+├── main.py           # Click CLI entry (spider command)
 └── spiders/
     └── site_spider.py  # Main spider (crawls to depth, discovers PDF/XLSX)
 ```
@@ -33,7 +33,7 @@ irandade_spider/
 ## CLI
 
 ```bash
-spider crawl URLS... [--depth | -d] [--output-dir | -o] [--rate-limit | -r] [--concurrent | -c]
+spider [OPTIONS] URLS...
 ```
 
 ### Arguments

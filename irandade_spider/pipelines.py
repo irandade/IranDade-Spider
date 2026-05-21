@@ -35,6 +35,17 @@ def get_extension(path: Path) -> str:
     return suffix if suffix else "unknown"
 
 
+def get_header(headers: dict, key: bytes, default: str | None = None) -> str | None:
+    val = headers.get(key, default)
+    if isinstance(val, list):
+        val = val[0] if val else default
+    if isinstance(val, bytes):
+        val = val.decode(errors="replace")
+    if not val:
+        return None
+    return str(val)
+
+
 class PagePipeline:
     def __init__(self, download_root: Path):
         self.download_root = download_root
@@ -75,12 +86,12 @@ class PagePipeline:
             url=item["url"],
             referer=item.get("referer"),
             accessed_at=datetime.now(timezone.utc),
-            etag=item["response_headers"].get(b"Etag", b"").decode(errors="replace") or None,
-            last_modified=item["response_headers"].get(b"Last-Modified", b"").decode(errors="replace") or None,
+            etag=get_header(item["response_headers"], b"Etag"),
+            last_modified=get_header(item["response_headers"], b"Last-Modified"),
             content_hash=content_hash,
             size=file_path.stat().st_size,
             depth=item.get("depth", 0),
-            status_code=int(item["response_headers"].get(b"Status", b"200").decode(errors="replace") or 200),
+            status_code=int(item.get("status", 200)),
         )
 
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -129,8 +140,8 @@ class FilePipeline:
             url=item["url"],
             referer=item.get("referer"),
             accessed_at=datetime.now(timezone.utc),
-            etag=item["response_headers"].get(b"Etag", b"").decode(errors="replace") or None,
-            last_modified=item["response_headers"].get(b"Last-Modified", b"").decode(errors="replace") or None,
+            etag=get_header(item["response_headers"], b"Etag"),
+            last_modified=get_header(item["response_headers"], b"Last-Modified"),
             content_hash=content_hash,
             size=file_path.stat().st_size,
         )

@@ -35,7 +35,7 @@ class SiteSpider(scrapy.Spider):
         self.state_path = state_path
         self.allowed_domains = [urlparse(u).netloc for u in self.start_urls]
 
-    def start_requests(self):
+    async def start(self):
         for url in self.start_urls:
             yield scrapy.Request(url, callback=self.parse, errback=self.errback)
 
@@ -48,6 +48,7 @@ class SiteSpider(scrapy.Spider):
             content_type=response.headers.get(b"Content-Type", b"").decode(errors="replace"),
             depth=depth,
             referer=response.request.headers.get(b"Referer", b"").decode(errors="replace") or None,
+            status=response.status,
             response_headers=dict(response.headers),
         )
         yield page_item

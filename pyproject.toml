@@ -5,7 +5,7 @@ description = "Scrapy spider to crawl sites and download PDF/XLSX files"
 requires-python = ">=3.12"
 
 [project.scripts]
-spider = "irandade_spider.main:app"
+spider = "irandade_spider.main:entry"
 
 [dependency-groups]
 dev = [
