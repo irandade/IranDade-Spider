@@ -9,10 +9,6 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
 ]
-
-[project.scripts]
-spider = "irandade_spider.main:app"
-
-[build-system]
+ [build-system]
 requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
