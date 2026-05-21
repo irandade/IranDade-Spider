@@ -67,7 +67,7 @@ class PagePipeline:
         else:
             file_path.write_text(body, encoding="utf-8")
 
-        content_hash = hashlib.sha256(body if isinstance(body, bytes) else body.encode()).hexdigest()
+        content_hash = "sha256:" + hashlib.sha256(body if isinstance(body, bytes) else body.encode()).hexdigest()
 
         meta = PageMeta(
             name=rel_path.name,
@@ -121,7 +121,7 @@ class FilePipeline:
         else:
             file_path.write_bytes(body.encode())
 
-        content_hash = hashlib.sha256(body if isinstance(body, bytes) else body.encode()).hexdigest()
+        content_hash = "sha256:" + hashlib.sha256(body if isinstance(body, bytes) else body.encode()).hexdigest()
 
         meta = FileMeta(
             name=rel_path.name,

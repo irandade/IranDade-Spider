@@ -14,7 +14,6 @@ class SiteSpider(scrapy.Spider):
     name = "site_spider"
 
     custom_settings = {
-        "ROBOTSTXT_OBEY": True,
         "MEDIA_ALLOW_REDIRECTS": True,
         "HTTPERROR_ALLOWED_CODES": [404, 403, 500],
     }

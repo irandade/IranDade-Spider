@@ -53,21 +53,18 @@ class RandomDelayMiddleware:
 
 
 class ResumeMiddleware:
-    def __init__(self, state_path: Optional[Path] = None):
-        self.state_path = state_path
+    def __init__(self):
+        self.state_path: Optional[Path] = None
         self.crawl_state: Optional[CrawlState] = None
 
     @classmethod
     def from_crawler(cls, crawler):
-        state_path = None
-        spider = getattr(crawler, "spider", None)
-        if spider and hasattr(spider, "state_path"):
-            state_path = spider.state_path
-        o = cls(state_path)
+        o = cls()
         crawler.signals.connect(o.spider_opened, signal=signals.spider_opened)
         return o
 
     def spider_opened(self, spider):
+        self.state_path = getattr(spider, "state_path", None)
         if self.state_path and self.state_path.exists():
             with open(self.state_path) as f:
                 data = json.load(f)
