@@ -5,11 +5,12 @@ Scrapy-based spider CLI that crawls websites, discovers PDF/XLSX files, download
 ## Quick Start
 
 ```bash
-.venv/bin/spider crawl https://example.com --depth 3 --output-dir /data/downloads --rate-limit 2
+uv sync
+uv run spider crawl https://example.com --depth 3 --output-dir /data/downloads --rate-limit 2
 ```
 
 ## Tech Stack
-- **Python 3.14+** with `.venv`
+- **Python 3.14+** with `.venv` (uv-managed)
 - **Scrapy** for crawling
 - **Typer** for CLI
 - **Pydantic/Pydantic-Settings** for config & models
@@ -129,9 +130,9 @@ URLs → SiteSpider → parse() →
 ## Development
 
 ```bash
-.venv/bin/pip install -e .          # Dev install
-.venv/bin/spider --help             # Verify CLI
-.venv/bin/python -m pytest          # Run tests
+uv sync                                # Install all dependencies
+uv run spider --help                   # Verify CLI
+uv run python -m pytest                # Run tests
 ```
 
 ## Edge Cases & Error Handling

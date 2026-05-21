@@ -3,16 +3,18 @@ name = "irandade-spider"
 version = "0.1.0"
 description = "Scrapy spider to crawl sites and download PDF/XLSX files"
 requires-python = ">=3.12"
-dependencies = [
+
+[project.scripts]
+spider = "irandade_spider.main:app"
+
+[dependency-groups]
+dev = [
     "scrapy>=2.11",
     "typer>=0.12",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
 ]
 
-[project.scripts]
-spider = "irandade_spider.main:app"
-
 [build-system]
-requires = ["setuptools>=75"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
