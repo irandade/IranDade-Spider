@@ -1,5 +1,6 @@
 import json
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,6 +10,13 @@ from scrapy.exceptions import DropItem
 
 from irandade_spider.items import PageItem, FileItem
 from irandade_spider.models import FileMeta, PageMeta, CrawlState
+
+
+_PORT_RE = re.compile(r":\d+$")
+
+
+def normalize_domain(netloc: str) -> str:
+    return _PORT_RE.sub("", netloc)
 
 
 def url_to_relative_path(url: str) -> Path:
@@ -49,25 +57,27 @@ def get_header(headers: dict, key: bytes, default: str | None = None) -> str | N
 class PagePipeline:
     def __init__(self, download_root: Path):
         self.download_root = download_root
+        self.crawler = None
 
     @classmethod
     def from_crawler(cls, crawler):
         root = Path(crawler.settings["DOWNLOAD_ROOT"]).expanduser()
-        return cls(root)
+        o = cls(root)
+        o.crawler = crawler
+        return o
 
-    def process_item(self, item, spider: Spider):
+    def process_item(self, item, spider=None):
         if not isinstance(item, PageItem):
             return item
 
-        domain = urlparse(item["url"]).netloc
+        domain = normalize_domain(urlparse(item["url"]).netloc)
         rel_path = url_to_relative_path(item["url"])
         rel_path = ensure_ext(rel_path, item.get("content_type", "text/html"))
 
-        files_dir = self.download_root / domain / "files"
-        meta_dir = self.download_root / domain / "meta"
+        cache_dir = self.download_root / domain / "cache"
 
-        file_path = files_dir / rel_path
-        meta_path = meta_dir / f"{rel_path}.meta.json"
+        file_path = cache_dir / rel_path
+        meta_path = cache_dir / f"{rel_path}.meta.json"
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,31 +107,34 @@ class PagePipeline:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
 
-        spider.logger.info(f"Saved page: {file_path}")
+        active = spider or self.crawler.spider
+        active.logger.info(f"Saved page: {file_path}")
         return item
 
 
 class FilePipeline:
     def __init__(self, download_root: Path):
         self.download_root = download_root
+        self.crawler = None
 
     @classmethod
     def from_crawler(cls, crawler):
         root = Path(crawler.settings["DOWNLOAD_ROOT"]).expanduser()
-        return cls(root)
+        o = cls(root)
+        o.crawler = crawler
+        return o
 
-    def process_item(self, item, spider: Spider):
+    def process_item(self, item, spider=None):
         if not isinstance(item, FileItem):
             return item
 
-        domain = urlparse(item["url"]).netloc
+        domain = normalize_domain(urlparse(item["url"]).netloc)
         rel_path = url_to_relative_path(item["url"])
 
         files_dir = self.download_root / domain / "files"
-        meta_dir = self.download_root / domain / "meta"
 
         file_path = files_dir / rel_path
-        meta_path = meta_dir / f"{rel_path}.meta.json"
+        meta_path = files_dir / f"{rel_path}.meta.json"
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,7 +162,8 @@ class FilePipeline:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
 
-        spider.logger.info(f"Saved file: {file_path}")
+        active = spider or self.crawler.spider
+        active.logger.info(f"Saved file: {file_path}")
         return item
 
 
@@ -157,14 +171,19 @@ class StatePipeline:
     def __init__(self, download_root: Path):
         self.download_root = download_root
         self.seen: dict[str, str] = {}
+        self.crawler = None
+        self._count = 0
+        self._flush_interval = 10
 
     @classmethod
     def from_crawler(cls, crawler):
         root = Path(crawler.settings["DOWNLOAD_ROOT"]).expanduser()
-        return cls(root)
+        o = cls(root)
+        o.crawler = crawler
+        return o
 
-    def process_item(self, item, spider: Spider):
-        domain = urlparse(item["url"]).netloc
+    def process_item(self, item, spider=None):
+        domain = normalize_domain(urlparse(item["url"]).netloc)
         rel_path = url_to_relative_path(item["url"])
 
         if isinstance(item, PageItem):
@@ -172,24 +191,34 @@ class StatePipeline:
 
         meta_rel = f"{rel_path}.meta.json"
         self.seen[item["url"]] = str(meta_rel)
+        self._count += 1
+
+        if self._count % self._flush_interval == 0:
+            self._save_state(spider or self.crawler.spider)
+
         return item
 
-    def close_spider(self, spider):
+    def _save_state(self, spider=None):
         domains: dict[str, dict[str, str]] = {}
         for url, meta_rel in self.seen.items():
-            domain = urlparse(url).netloc
+            domain = normalize_domain(urlparse(url).netloc)
             domains.setdefault(domain, {})[url] = meta_rel
 
+        active = spider or self.crawler.spider
         for domain, urls in domains.items():
-            state_dir = self.download_root / domain / "meta"
+            state_dir = self.download_root / domain / "cache"
             state_dir.mkdir(parents=True, exist_ok=True)
             state = CrawlState(
                 domain=domain,
-                root_urls=list(getattr(spider, "start_urls", [])),
+                root_urls=list(getattr(active, "start_urls", [])),
                 last_crawl=datetime.now(timezone.utc),
+                max_depth=getattr(active, "max_depth", 0),
                 urls=urls,
             )
             state_path = state_dir / "crawl_state.json"
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(state.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-            spider.logger.info(f"State saved: {state_path} ({len(urls)} URLs)")
+        active.logger.info(f"State saved: {len(self.seen)} URLs tracked")
+
+    def close_spider(self, spider=None):
+        self._save_state(spider or self.crawler.spider)

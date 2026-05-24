@@ -29,3 +29,4 @@ class Settings(BaseSettings):
         ]
     )
     respect_robots_txt: bool = Field(default=True)
+    log_level: str = Field(default="INFO")

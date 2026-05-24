@@ -23,4 +23,8 @@ ITEM_PIPELINES = {
     "irandade_spider.pipelines.StatePipeline": 1000,
 }
 
+DOWNLOAD_HANDLERS = {
+    "https": "irandade_spider.handlers.NoVerifyHTTPSDownloadHandler",
+}
+
 AUTOTHROTTLE_ENABLED = False

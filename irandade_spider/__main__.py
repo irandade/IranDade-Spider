@@ -1,3 +1,3 @@
-from irandade_spider.main import entry
+from irandade_spider.main import app
 
-entry()
+app()

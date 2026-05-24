@@ -29,4 +29,5 @@ class CrawlState(BaseModel):
     domain: str
     root_urls: list[str]
     last_crawl: datetime | None = None
+    max_depth: int = 0
     urls: dict[str, str] = {}
