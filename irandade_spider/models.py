@@ -13,6 +13,8 @@ class BaseMeta(BaseModel):
     last_modified: str | None = None
     content_hash: str | None = None
     size: int | None = None
+    depth: int | None = None
+    orig_name: str | None = None
 
 
 class FileMeta(BaseMeta):
@@ -20,7 +22,6 @@ class FileMeta(BaseMeta):
 
 
 class PageMeta(BaseMeta):
-    depth: int
     status_code: int
 
 
@@ -30,4 +31,4 @@ class CrawlState(BaseModel):
     root_urls: list[str]
     last_crawl: datetime | None = None
     max_depth: int = 0
-    urls: dict[str, str] = {}
+    url_files: list[str] = []

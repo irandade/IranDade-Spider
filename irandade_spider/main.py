@@ -8,6 +8,7 @@ from scrapy.utils.project import get_project_settings
 
 from irandade_spider.config import Settings
 from irandade_spider.spiders.site_spider import SiteSpider
+from irandade_spider.stats import run_stat
 
 _PORT_RE = re.compile(r":\d+$")
 
@@ -58,10 +59,11 @@ def crawl(
     scrapy_settings["SPIDER_USER_AGENTS"] = ua_list
     scrapy_settings["ROBOTSTXT_OBEY"] = cfg.respect_robots_txt
     scrapy_settings["LOG_LEVEL"] = cfg.log_level
+    scrapy_settings["SPIDER_MAX_PATH_FILENAME_BYTES"] = cfg.max_path_filename_bytes
 
     url_list = list(urls)
     domain = normalize_domain(url_list[0].split("//")[-1].split("/")[0]) if url_list else "unknown"
-    state_path = download_root / domain / "cache" / "crawl_state.json"
+    state_path = download_root / domain / "states" / "state.json"
 
     process = CrawlerProcess(settings=scrapy_settings)
     process.crawl(
@@ -82,6 +84,20 @@ def crawl(
     typer.echo(f"State: {'resuming' if state_path.exists() else 'fresh start'}")
 
     process.start()
+
+
+@app.command()
+def report(
+    output_dir: Path | None = typer.Option(None, "--output-dir", "-o", help="Download root directory"),
+):
+    """Show detailed crawl report for a domain."""
+    cfg = Settings()
+    download_root = (
+        output_dir.expanduser().resolve()
+        if output_dir
+        else cfg.download_root.expanduser().resolve()
+    )
+    run_stat(download_root)
 
 
 if __name__ == "__main__":

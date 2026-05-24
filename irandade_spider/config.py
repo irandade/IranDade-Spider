@@ -30,3 +30,4 @@ class Settings(BaseSettings):
     )
     respect_robots_txt: bool = Field(default=True)
     log_level: str = Field(default="INFO")
+    max_path_filename_bytes: int = Field(default=200, ge=50)

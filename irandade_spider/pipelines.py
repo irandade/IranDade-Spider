@@ -3,7 +3,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from scrapy import Spider
 from scrapy.exceptions import DropItem
@@ -19,12 +19,16 @@ def normalize_domain(netloc: str) -> str:
     return _PORT_RE.sub("", netloc)
 
 
-def url_to_relative_path(url: str) -> Path:
+def url_to_relative_path(url: str, max_bytes: int = 200) -> Path:
     parsed = urlparse(url)
     path = parsed.path.strip("/")
     if not path:
         return Path("index.html")
-    return Path(path)
+    parts = path.split("/")
+    last = parts[-1]
+    if len(last.encode("utf-8")) > max_bytes:
+        parts[-1] = hashlib.sha256(last.encode()).hexdigest()[:32]
+    return Path("/".join(parts))
 
 
 def ensure_ext(path: Path, content_type: str) -> Path:
@@ -36,6 +40,17 @@ def ensure_ext(path: Path, content_type: str) -> Path:
         elif "spreadsheet" in content_type or "excel" in content_type:
             path = path.with_suffix(".xlsx")
     return path
+
+
+def get_orig_name(url: str, content_type: str, final_path: Path) -> str:
+    parsed = urlparse(url)
+    raw = parsed.path.strip("/")
+    if not raw:
+        return "index.html"
+    name = unquote(raw.split("/")[-1])
+    if final_path.suffix and not Path(name).suffix:
+        name += final_path.suffix
+    return name
 
 
 def get_extension(path: Path) -> str:
@@ -55,14 +70,16 @@ def get_header(headers: dict, key: bytes, default: str | None = None) -> str | N
 
 
 class PagePipeline:
-    def __init__(self, download_root: Path):
+    def __init__(self, download_root: Path, max_bytes: int = 200):
         self.download_root = download_root
+        self.max_bytes = max_bytes
         self.crawler = None
 
     @classmethod
     def from_crawler(cls, crawler):
         root = Path(crawler.settings["DOWNLOAD_ROOT"]).expanduser()
-        o = cls(root)
+        max_bytes = crawler.settings.getint("SPIDER_MAX_PATH_FILENAME_BYTES", 200)
+        o = cls(root, max_bytes=max_bytes)
         o.crawler = crawler
         return o
 
@@ -71,10 +88,10 @@ class PagePipeline:
             return item
 
         domain = normalize_domain(urlparse(item["url"]).netloc)
-        rel_path = url_to_relative_path(item["url"])
+        rel_path = url_to_relative_path(item["url"], max_bytes=self.max_bytes)
         rel_path = ensure_ext(rel_path, item.get("content_type", "text/html"))
 
-        cache_dir = self.download_root / domain / "cache"
+        cache_dir = self.download_root / domain / "caches"
 
         file_path = cache_dir / rel_path
         meta_path = cache_dir / f"{rel_path}.meta.json"
@@ -102,6 +119,7 @@ class PagePipeline:
             size=file_path.stat().st_size,
             depth=item.get("depth", 0),
             status_code=int(item.get("status", 200)),
+            orig_name=get_orig_name(item["url"], item.get("content_type", ""), rel_path),
         )
 
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -113,14 +131,16 @@ class PagePipeline:
 
 
 class FilePipeline:
-    def __init__(self, download_root: Path):
+    def __init__(self, download_root: Path, max_bytes: int = 200):
         self.download_root = download_root
+        self.max_bytes = max_bytes
         self.crawler = None
 
     @classmethod
     def from_crawler(cls, crawler):
         root = Path(crawler.settings["DOWNLOAD_ROOT"]).expanduser()
-        o = cls(root)
+        max_bytes = crawler.settings.getint("SPIDER_MAX_PATH_FILENAME_BYTES", 200)
+        o = cls(root, max_bytes=max_bytes)
         o.crawler = crawler
         return o
 
@@ -129,7 +149,7 @@ class FilePipeline:
             return item
 
         domain = normalize_domain(urlparse(item["url"]).netloc)
-        rel_path = url_to_relative_path(item["url"])
+        rel_path = url_to_relative_path(item["url"], max_bytes=self.max_bytes)
 
         files_dir = self.download_root / domain / "files"
 
@@ -157,6 +177,8 @@ class FilePipeline:
             last_modified=get_header(item["response_headers"], b"Last-Modified"),
             content_hash=content_hash,
             size=file_path.stat().st_size,
+            depth=item.get("depth"),
+            orig_name=get_orig_name(item["url"], item.get("content_type", ""), rel_path),
         )
 
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -170,7 +192,7 @@ class FilePipeline:
 class StatePipeline:
     def __init__(self, download_root: Path):
         self.download_root = download_root
-        self.seen: dict[str, str] = {}
+        self.seen: dict[str, dict] = {}
         self.crawler = None
         self._count = 0
         self._flush_interval = 10
@@ -183,14 +205,15 @@ class StatePipeline:
         return o
 
     def process_item(self, item, spider=None):
-        domain = normalize_domain(urlparse(item["url"]).netloc)
-        rel_path = url_to_relative_path(item["url"])
+        if not isinstance(item, PageItem):
+            return item
 
-        if isinstance(item, PageItem):
-            rel_path = ensure_ext(rel_path, item.get("content_type", "text/html"))
-
-        meta_rel = f"{rel_path}.meta.json"
-        self.seen[item["url"]] = str(meta_rel)
+        now = datetime.now(timezone.utc)
+        self.seen[item["url"]] = {
+            "discovered_at": now.isoformat(),
+            "is_scrapped": False,
+            "depth": item.get("depth", 0),
+        }
         self._count += 1
 
         if self._count % self._flush_interval == 0:
@@ -199,23 +222,40 @@ class StatePipeline:
         return item
 
     def _save_state(self, spider=None):
-        domains: dict[str, dict[str, str]] = {}
-        for url, meta_rel in self.seen.items():
+        domains: dict[str, dict[str, dict]] = {}
+        for url, info in self.seen.items():
             domain = normalize_domain(urlparse(url).netloc)
-            domains.setdefault(domain, {})[url] = meta_rel
+            domains.setdefault(domain, {})[url] = info
 
         active = spider or self.crawler.spider
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%Y%m%d")
+
         for domain, urls in domains.items():
-            state_dir = self.download_root / domain / "cache"
+            state_dir = self.download_root / domain / "states"
             state_dir.mkdir(parents=True, exist_ok=True)
+
+            url_items = list(urls.items())
+            url_files: list[str] = []
+            max_per_file = 1000
+
+            for i in range(0, len(url_items), max_per_file):
+                chunk = dict(url_items[i : i + max_per_file])
+                no = i // max_per_file
+                filename = f"urls_{date_str}_{no}.json"
+                url_path = state_dir / filename
+                with open(url_path, "w", encoding="utf-8") as f:
+                    json.dump(chunk, f, indent=2, ensure_ascii=False)
+                url_files.append(filename)
+
             state = CrawlState(
                 domain=domain,
                 root_urls=list(getattr(active, "start_urls", [])),
-                last_crawl=datetime.now(timezone.utc),
+                last_crawl=now,
                 max_depth=getattr(active, "max_depth", 0),
-                urls=urls,
+                url_files=url_files,
             )
-            state_path = state_dir / "crawl_state.json"
+            state_path = state_dir / "state.json"
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(state.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
         active.logger.info(f"State saved: {len(self.seen)} URLs tracked")

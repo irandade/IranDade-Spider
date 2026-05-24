@@ -38,6 +38,7 @@ irandade_spider/
 
 ```bash
 spider crawl [OPTIONS] URLS...
+spider report [OPTIONS]
 ```
 
 ### Arguments
@@ -50,20 +51,53 @@ spider crawl [OPTIONS] URLS...
 | `--concurrent, -c` | Concurrent requests (overrides SPIDER_CONCURRENT_REQUESTS) |
 | `--refresh, -f` | Check cached URLs for updates via conditional requests (default: skip cached) |
 
+### Arguments (report)
+| Arg | Description |
+|-----|-------------|
+| `--output-dir, -o` | Download root directory (defaults to SPIDER_DOWNLOAD_ROOT) |
+
 ## Storage Layout
 
 ```
 <download_root>/<domain>/
-  cache/
-    crawl_state.json                           # URL -> meta_path index
+  caches/
     <path>/<to>/<page>.html                    # HTML discovery pages
     <path>/<to>/<page>.html.meta.json          # per-page metadata (side-by-side)
   files/
     <path>/<to>/<file>.pdf                     # actual files (site structure preserved)
     <path>/<to>/<file>.pdf.meta.json           # per-file metadata (side-by-side)
+  states/
+    state.json                                 # metadata (domain, root_urls, max_depth, url_files list)
+    run_<date>_<no>.json                       # spider-managed: ALL discovered URLs (continuously updated)
+    urls_<date>_<no>.json                      # pipeline-managed: URL index (max 1000 URLs per file)
 ```
 
 Domain names are normalized (port stripped), so `example.com:443` and `example.com` share the same folder.
+
+Each `run_<date>_<no>.json` and `urls_<date>_<no>.json` file contains:
+```json
+{
+  "https://example.com/page": {
+    "discovered_at": "2026-05-24T10:00:00+00:00",
+    "is_scrapped": false,
+    "depth": 2
+  }
+}
+```
+- `discovered_at`: ISO datetime when the URL was first discovered
+- `is_scrapped`: `false` initially (links not yet extracted from the page)
+
+The `run_*.json` file is written by the spider every N discovered URLs (default 10) and on close. It contains ALL discovered URLs (pages + files). On resume, all previous `run_*.json` files are loaded and merged into `_url_state` alongside the pipeline's `urls_*.json` files.
+
+The `report` command reads these state files and uses `rich` tables to display:
+- **Domain Overview**: panel with domain, last crawl, max depth, page/file counts, status distribution
+- **All Discovered URLs**: table of every URL from run files with depth, type, status
+- **Files by Type**: breakdown by extension with count, total/average/min/max sizes
+- **Cached Files Detail**: per-file table with name, type, size, depth, URL
+- **Pending URLs**: URLs with `is_scrapped=false` (not yet processed)
+- **Last Run**: summary of the most recent run file
+- **Page Status Distribution**: HTTP status code bar chart
+- **Crawl Timeline**: all run files with total/pages/files/pending counts
 
 Each `.meta.json` file contains the common fields above. **PageMeta** additionally includes:
 ```json
@@ -94,6 +128,7 @@ SPIDER_RANDOMIZE_DELAY=True
 SPIDER_RESPECT_ROBOTSTXT=True
 SPIDER_USER_AGENTS=["...at least 7 UAs..."]
 SPIDER_LOG_LEVEL=INFO
+SPIDER_MAX_PATH_FILENAME_BYTES=200
 ```
 
 CLI options override .env values. See `.env.example` for all variables.
@@ -102,34 +137,42 @@ CLI options override .env values. See `.env.example` for all variables.
 
 ### Data Flow
 ```
-Spider startup → _scan_cache() → build cached_urls dict from cache/ + files/
+Spider startup → _scan_cache() → build cached_urls dict from caches/ + files/
 URLs → SiteSpider → start() →
   ├─ cached URL (no --refresh) → skip (no HTTP request)
   ├─ cached URL (--refresh) → conditional request → 304 dropped / 200 re-downloaded
-  ├─ not cached → HTTP request →
-  │   ├─ PageItem → PagePipeline → saves HTML + .html.meta.json (in cache/)
+  ├─ not cached → HTTP request → _record_discovered_url() → periodic run_*.json flush
+  │   ├─ PageItem → PagePipeline → saves HTML + .html.meta.json (in caches/)
   │   ├─ FileItem → FilePipeline → saves file + .meta.json (in files/)
   │   └─ same-domain links → check cache → skip or request (recursive, up to max_depth)
-  └─ depth increased → _rescan_leaf_pages() → parse cached leaf HTML for new links
-                            → StatePipeline → writes crawl_state.json on spider close
+  ├─ depth increased → _rescan_leaf_pages() → parse cached leaf HTML for new links
+  └─ resume → _load_run_state() → merge previous run_*.json into _url_state
+             → _resume_unscrapped() → re-parse cached HTML or request uncached URLs
+             → StatePipeline → writes state.json + urls_*.json in states/
 ```
 
 ### Idempotent Crawl
-1. **Startup scan**: Walk `cache/` and `files/` for all `.meta.json` files, build URL→metadata index
+1. **Startup scan**: Walk `caches/` and `files/` for all `.meta.json` files, build URL→metadata index
 2. **Cache-skip mode (default)**: URLs with cached content are skipped entirely (no HTTP request)
 3. **Refresh mode (`--refresh`)**: Cached URLs get conditional requests (If-None-Match/If-Modified-Since)
    - 304 → dropped by ResumeMiddleware, no re-processing
    - 200 → re-downloaded, metadata updated
 4. **Depth increase**: When `--depth` increases, cached leaf pages (at old max_depth) are re-parsed from disk for new links
-5. **Periodic stats**: Every 10 URLs checked, INFO log with aggregated progress (checked, discovered, downloaded, skipped, rates)
-6. **Incremental state saving**: `crawl_state.json` is written every 10 items (PageItem + FileItem) to prevent data loss on interruption
+5. **Periodic state**: Every 10 discovered URLs, spider flushes `_url_state` to `run_{date}_{no}.json` to survive crashes
+6. **Final flush**: On `closed()`, spider flushes final `_url_state` to `run_{date}_{no}.json`
 
 ### Resume Mechanism
-1. `crawl_state.json` maps URL → relative meta file path
-2. `ResumeMiddleware` injects `If-None-Match`/`If-Modified-Since` from `request.meta["conditional"]`
-3. Server responds 304 → middleware drops response (no re-processing)
-4. Server responds 200 → pipeline updates meta JSON with new etag/hash
-5. Uncached URLs are requested normally
+1. `run_*.json` files track ALL discovered URLs (pages + files) with per-URL metadata
+2. `urls_<date>_<no>.json` files map URL → relative meta file path (chunked at 1000 URLs per file)  
+3. On startup, both `run_*.json` and `urls_*.json` files are loaded and merged into `_url_state`
+4. `_resume_unscrapped()` iterates URLs with `is_scrapped=false`:
+   - With cached HTML → re-reads HTML from disk, extracts links, yields requests
+   - Without cached HTML (pending URL from crash) → yields a fresh request for the URL
+   - Cached file URLs → skipped (no links to extract, no re-download needed)
+5. `ResumeMiddleware` injects `If-None-Match`/`If-Modified-Since` from `request.meta["conditional"]`
+6. Server responds 304 → middleware drops response (no re-processing)
+7. Server responds 200 → pipeline updates meta JSON with new etag/hash
+8. Uncached URLs are requested normally
 
 ### Middleware Pipeline (order)
 | Priority | Middleware | Purpose |
@@ -141,16 +184,18 @@ URLs → SiteSpider → start() →
 ### Item Pipelines (order)
 | Priority | Pipeline | Purpose |
 |----------|----------|---------|
-| 200 | PagePipeline | Save HTML + metadata (side-by-side in cache/) |
+| 200 | PagePipeline | Save HTML + metadata (side-by-side in caches/) |
 | 300 | FilePipeline | Save PDF/Excel + metadata (side-by-side in files/) |
-| 1000 | StatePipeline | Build crawl_state.json index |
+| 1000 | StatePipeline | Build state.json + urls_*.json files |
 
 ## Key Design Decisions
 - **Scrapy over aiohttp**: Leverages Scrapy's middleware stack, retries, robots.txt, and concurrency control
 - **Per-file JSON metadata instead of DB**: Simpler, no external dependencies, human-readable
 - **`{filename}.meta.json` naming**: Clear association between file and its metadata, stored side-by-side
-- **Side-by-side metadata**: `.meta.json` files sit next to their content files (in `cache/` for pages, `files/` for downloads)
-- **`crawl_state.json` is written every 10 items**: `StatePipeline` tracks a counter and calls `_save_state()` periodically, then again on `close_spider()`. This ensures safe interruption without data loss.
+- **Side-by-side metadata**: `.meta.json` files sit next to their content files (in `caches/` for pages, `files/` for downloads)
+- **Spider-managed run file**: Spider writes ALL discovered URLs (pages + files) to `states/run_<date>_<no>.json`, flushed every 10 new URLs and on `closed()`. This ensures pending URLs discovered during link extraction survive crashes, without waiting for the pipeline flush interval.
+- **StatePipeline URL files**: `StatePipeline` writes per-page URL→meta_path pairs to `states/urls_<date>_<no>.json` files (1000 URLs per chunk). On resume, both `run_*.json` and `urls_*.json` are loaded and merged.
+- **state.json**: Lightweight metadata file in `states/` (replaces `crawl_state.json`). Tracks domain, root URLs, max_depth, and url_files list.
 - **DOWNLOAD_ROOT in Scrapy settings**: Custom setting read by pipelines, not a built-in Scrapy setting
 - **Same-domain restriction**: Spider only follows links within allowed_domains (derived from start URLs)
 - **Port-stripped domains**: `example.com:443` and `example.com` share the same folder
@@ -175,6 +220,7 @@ uv run python -m pytest                # Run tests (if any exist)
 - Non-HTTP links (mailto, tel, javascript): filtered in spider.parse()
 - Missing file extensions: infer from Content-Type header via ensure_ext()
 - Failed requests: logged via errback, spider continues
+- Long filenames (>SPIDER_MAX_PATH_FILENAME_BYTES): last path segment replaced with SHA256 hash to avoid filesystem limits
 - Server errors (5xx): retried up to 3 times via Scrapy retry middleware
 - HTTP 404/403/500: passed through to spider for processing (not dropped)
 - Empty paths (root URL): saved as index.html
