@@ -13,7 +13,17 @@ from scrapy.selector import Selector
 from irandade_spider.items import PageItem, FileItem
 from irandade_spider.models import CrawlState
 
-FILE_EXTENSIONS = (".pdf", ".xlsx", ".xls", ".xlsm", ".xlsb")
+FILE_EXTENSIONS = (
+    ".pdf", ".xlsx", ".xls", ".xlsm", ".xlsb",
+    ".doc", ".docx", ".zip", ".rar", ".ppt", ".pptx",".pps",".ppsx",
+)
+BLOCKED_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg",
+    ".ico", ".tiff", ".tif",
+    ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm",
+    ".mp3", ".wav", ".aac", ".ogg", ".flac", ".wma",
+    ".css", ".js",
+)
 
 _PORT_RE = re.compile(r":\d+$")
 _STATS_INTERVAL = 10
@@ -23,9 +33,63 @@ def normalize_domain(netloc: str) -> str:
     return _PORT_RE.sub("", netloc)
 
 
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    # canonicalize scheme: treat http as https for deduplication
+    if scheme in ("http", "https"):
+        scheme = "https"
+    # strip default ports
+    if netloc.endswith(":443"):
+        netloc = netloc[:-4]
+    elif netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    path = parsed.path
+    if not path:
+        path = "/"
+    # rebuild URL without fragment, preserving query
+    if parsed.query:
+        return f"{scheme}://{netloc}{path}?{parsed.query}"
+    return f"{scheme}://{netloc}{path}"
+
+
 def is_file_url(url: str) -> bool:
     path = urlparse(url).path
     return path.lower().endswith(FILE_EXTENSIONS)
+
+
+def is_blocked_url(url: str) -> bool:
+    path = urlparse(url).path
+    return path.lower().endswith(BLOCKED_EXTENSIONS)
+
+
+def _is_file_content_type(content_type: str) -> bool:
+    ct = content_type.lower()
+    return (
+        "pdf" in ct
+        or "excel" in ct
+        or "spreadsheet" in ct
+        or "zip" in ct
+        or "rar" in ct
+        or "word" in ct
+        or "msword" in ct
+        or "powerpoint" in ct
+        or "presentation" in ct
+        or ct == "application/octet-stream"
+    )
+
+
+def _is_blocked_content_type(content_type: str) -> bool:
+    ct = content_type.lower()
+    return (
+        ct.startswith("image/")
+        or ct.startswith("video/")
+        or ct.startswith("audio/")
+        or "css" in ct
+        or "javascript" in ct
+        or ct == "text/javascript"
+    )
 
 
 def url_to_relative_path(url: str, max_bytes: int = 200) -> Path:
@@ -107,6 +171,7 @@ class SiteSpider(scrapy.Spider):
 
         self._load_run_state()
 
+        scanned = 0
         for domain_dir in download_root.iterdir():
             if not domain_dir.is_dir():
                 continue
@@ -115,17 +180,20 @@ class SiteSpider(scrapy.Spider):
                 if not subdir.exists():
                     continue
                 for meta_path in subdir.rglob("*.meta.json"):
+                    scanned += 1
+                    if scanned % 1000 == 0:
+                        self.logger.info(f"Cache scan: processed {scanned} meta files...")
                     try:
                         with open(meta_path, encoding="utf-8") as f:
                             meta = json.load(f)
                         url = meta.get("url")
                         if url:
-                            self.cached_urls[url] = meta
+                            self.cached_urls[normalize_url(url)] = meta
                     except (json.JSONDecodeError, OSError) as e:
                         self.logger.warning(f"Cache scan: skipping corrupted {meta_path}: {e}")
 
         self.crawl_stats["cached"] = len(self.cached_urls)
-        self.logger.info(f"Cache scan: found {len(self.cached_urls)} cached URLs")
+        self.logger.info(f"Cache scan: found {len(self.cached_urls)} cached URLs ({scanned} meta files scanned)")
 
     def _load_old_state(self) -> dict | None:
         if self.state_path and self.state_path.exists():
@@ -135,6 +203,26 @@ class SiteSpider(scrapy.Spider):
             except (json.JSONDecodeError, OSError) as e:
                 self.logger.warning(f"Failed to load crawl state: {e}")
         return None
+
+    def _merge_url_state(self, url: str, info: dict):
+        norm_url = normalize_url(url)
+        existing = self._url_state.get(norm_url)
+        if existing is None:
+            self._url_state[norm_url] = info
+            return
+        # Prefer scrapped=True over False; keep earliest discovered_at
+        if info.get("is_scrapped") is True:
+            existing["is_scrapped"] = True
+        if info.get("discovered_at") and (
+            not existing.get("discovered_at")
+            or info["discovered_at"] < existing["discovered_at"]
+        ):
+            existing["discovered_at"] = info["discovered_at"]
+        # Use the smaller depth if available
+        new_depth = info.get("depth")
+        old_depth = existing.get("depth")
+        if new_depth is not None and (old_depth is None or new_depth < old_depth):
+            existing["depth"] = new_depth
 
     def _load_url_state(self, old_state: dict):
         url_files = old_state.get("url_files", [])
@@ -149,7 +237,7 @@ class SiteSpider(scrapy.Spider):
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
                     for url, info in data.items():
-                        self._url_state[url] = info
+                        self._merge_url_state(url, info)
             except (json.JSONDecodeError, OSError) as e:
                 self.logger.warning(f"Failed to load URL file {filename}: {e}")
         self.logger.debug(f"Loaded {len(self._url_state)} URL states from {len(url_files)} files")
@@ -171,7 +259,7 @@ class SiteSpider(scrapy.Spider):
                     with open(f, encoding="utf-8") as fh:
                         data = json.load(fh)
                     for url, info in data.items():
-                        self._url_state[url] = info
+                        self._merge_url_state(url, info)
                 except (json.JSONDecodeError, OSError) as e:
                     self.logger.warning(f"Failed to load run file {f}: {e}")
 
@@ -225,20 +313,21 @@ class SiteSpider(scrapy.Spider):
         self._pending_dirty_count = 0
 
     async def _maybe_request(self, url: str, callback, depth: int = 0):
-        if url in self._processed_urls:
+        norm_url = normalize_url(url)
+        if norm_url in self._processed_urls:
             return
-        self._processed_urls.add(url)
+        self._processed_urls.add(norm_url)
         self.crawl_stats["checked"] += 1
 
-        if url in self.cached_urls:
+        if norm_url in self.cached_urls:
             if self.refresh:
-                meta = self.cached_urls[url]
+                meta = self.cached_urls[norm_url]
                 conditional = {
                     "etag": meta.get("etag"),
                     "last_modified": meta.get("last_modified"),
                 }
                 self.crawl_stats["requested"] += 1
-                self.logger.debug(f"Refresh request: {url}")
+                self.logger.debug(f"Refresh request: {norm_url}")
                 yield scrapy.Request(
                     url,
                     callback=callback,
@@ -251,14 +340,24 @@ class SiteSpider(scrapy.Spider):
                 )
             else:
                 self.crawl_stats["skipped"] += 1
-                if is_file_url(url):
+                if is_file_url(norm_url):
                     self.crawl_stats["files_skipped"] += 1
-                self.logger.debug(f"Skipping cached URL: {url}")
+                self.logger.debug(f"Skipping cached URL: {norm_url}")
+                # Record cached URLs in state so they are not re-discovered on resume
+                if norm_url not in self._url_state:
+                    self._url_state[norm_url] = {
+                        "discovered_at": datetime.now(timezone.utc).isoformat(),
+                        "is_scrapped": True,
+                        "depth": depth,
+                    }
+                    self._pending_dirty_count += 1
+                    if self._pending_dirty_count >= self._pending_flush_interval:
+                        self._flush_run_state()
         else:
             self.crawl_stats["requested"] += 1
             self.crawl_stats["discovered"] += 1
-            self._record_discovered_url(url, depth)
-            self.logger.debug(f"Requesting new URL: {url}")
+            self._record_discovered_url(norm_url, depth)
+            self.logger.debug(f"Requesting new URL: {norm_url}")
             yield scrapy.Request(
                 url,
                 callback=callback,
@@ -271,11 +370,13 @@ class SiteSpider(scrapy.Spider):
             return
 
         for href in response.css("a::attr(href)").getall():
-            url = response.urljoin(href)
+            url = normalize_url(response.urljoin(href))
             parsed = urlparse(url)
             if not parsed.scheme.startswith("http"):
                 continue
             if normalize_domain(parsed.netloc) not in self.allowed_domains:
+                continue
+            if is_blocked_url(url):
                 continue
 
             is_file_link = is_file_url(url)
@@ -300,7 +401,17 @@ class SiteSpider(scrapy.Spider):
             return
 
         new_links_count = 0
-        for url, meta in leaf_pages:
+        skipped_count = 0
+        reread_count = 0
+        for idx, (url, meta) in enumerate(leaf_pages, 1):
+            self.crawl_stats["checked"] += 1
+            if idx % 100 == 0:
+                self.logger.info(
+                    f"Rescan: processed {idx}/{len(leaf_pages)} leaf pages "
+                    f"({skipped_count} skipped, {reread_count} re-read, {new_links_count} new links queued)"
+                )
+                self._log_periodic_stats()
+
             domain = normalize_domain(urlparse(url).netloc)
             download_root = Path(self._download_root)
             max_bytes = self.settings.getint("SPIDER_MAX_PATH_FILENAME_BYTES", 200)
@@ -318,14 +429,17 @@ class SiteSpider(scrapy.Spider):
                 self.logger.warning(f"Rescan: cannot read {cache_file}: {e}")
                 continue
 
+            reread_count += 1
             sel = Selector(text=html)
             for href in sel.css("a::attr(href)").getall():
-                full_url = urljoin(url, href)
+                full_url = normalize_url(urljoin(url, href))
 
                 parsed = urlparse(full_url)
                 if not parsed.scheme.startswith("http"):
                     continue
                 if normalize_domain(parsed.netloc) not in self.allowed_domains:
+                    continue
+                if is_blocked_url(full_url):
                     continue
 
                 if full_url in self._processed_urls:
@@ -358,9 +472,19 @@ class SiteSpider(scrapy.Spider):
                         new_links_count += 1
                     else:
                         self.crawl_stats["skipped"] += 1
+                        skipped_count += 1
                         if is_file_link:
                             self.crawl_stats["files_skipped"] += 1
                         self.logger.debug(f"Rescan: skipping cached URL: {full_url}")
+                        if full_url not in self._url_state:
+                            self._url_state[full_url] = {
+                                "discovered_at": datetime.now(timezone.utc).isoformat(),
+                                "is_scrapped": True,
+                                "depth": leaf_depth + 1,
+                            }
+                            self._pending_dirty_count += 1
+                            if self._pending_dirty_count >= self._pending_flush_interval:
+                                self._flush_run_state()
                 else:
                     self.crawl_stats["requested"] += 1
                     self.crawl_stats["discovered"] += 1
@@ -393,8 +517,18 @@ class SiteSpider(scrapy.Spider):
 
         max_bytes = self.settings.getint("SPIDER_MAX_PATH_FILENAME_BYTES", 200)
         resumed_count = 0
-        for url in unscrapped:
+        skipped_count = 0
+        reread_count = 0
+        for idx, url in enumerate(unscrapped, 1):
             self._processed_urls.add(url)
+            self.crawl_stats["checked"] += 1
+            if idx % 100 == 0:
+                self.logger.info(
+                    f"Resume: processed {idx}/{len(unscrapped)} unscrapped URLs "
+                    f"({skipped_count} cached skipped, {reread_count} re-read from disk, {resumed_count} new requests)"
+                )
+                self._log_periodic_stats()
+
             source_depth = self._url_state[url].get("depth", 0)
 
             is_file_link = is_file_url(url)
@@ -402,14 +536,17 @@ class SiteSpider(scrapy.Spider):
 
             if url in self.cached_urls:
                 if is_file_link:
+                    skipped_count += 1
                     self.crawl_stats["skipped"] += 1
                     self.crawl_stats["files_skipped"] += 1
                     self._mark_scrapped(url)
                     self.logger.debug(f"Resume: skipping cached file URL: {url}")
                     continue
 
-                if source_depth + 1 > self.max_depth:
+                if source_depth >= self.max_depth:
+                    skipped_count += 1
                     self._mark_scrapped(url)
+                    self.logger.debug(f"Resume: cached page at max depth, marking done: {url}")
                     continue
 
                 domain = normalize_domain(urlparse(url).netloc)
@@ -434,16 +571,21 @@ class SiteSpider(scrapy.Spider):
                     self.logger.warning(f"Resume: cannot read {cache_file}: {e}")
                     continue
 
+                reread_count += 1
                 sel = Selector(text=html)
                 for href in sel.css("a::attr(href)").getall():
-                    full_url = urljoin(url, href)
+                    full_url = normalize_url(urljoin(url, href))
 
                     parsed = urlparse(full_url)
                     if not parsed.scheme.startswith("http"):
                         continue
                     if normalize_domain(parsed.netloc) not in self.allowed_domains:
                         continue
+                    if is_blocked_url(full_url):
+                        continue
 
+                    if full_url in self._url_state:
+                        continue
                     if full_url in self._processed_urls:
                         continue
                     self._processed_urls.add(full_url)
@@ -474,9 +616,19 @@ class SiteSpider(scrapy.Spider):
                             resumed_count += 1
                         else:
                             self.crawl_stats["skipped"] += 1
+                            skipped_count += 1
                             if link_is_file:
                                 self.crawl_stats["files_skipped"] += 1
                             self.logger.debug(f"Resume: skipping cached URL: {full_url}")
+                            if full_url not in self._url_state:
+                                self._url_state[full_url] = {
+                                    "discovered_at": datetime.now(timezone.utc).isoformat(),
+                                    "is_scrapped": True,
+                                    "depth": source_depth + 1,
+                                }
+                                self._pending_dirty_count += 1
+                                if self._pending_dirty_count >= self._pending_flush_interval:
+                                    self._flush_run_state()
                     else:
                         self.crawl_stats["requested"] += 1
                         self.crawl_stats["discovered"] += 1
@@ -528,14 +680,22 @@ class SiteSpider(scrapy.Spider):
             yield req
 
     async def parse(self, response: Response, **kwargs):
+        response_url = normalize_url(response.url)
         if response.status == 304:
-            self.logger.debug(f"304 not modified: {response.url}")
+            self.logger.debug(f"304 not modified: {response_url}")
             self._log_periodic_stats()
             return
 
         depth = response.meta.get("depth", 0)
         is_refresh = response.meta.get("is_refresh", False)
-        is_file = is_file_url(response.url)
+        content_type = response.headers.get(b"Content-Type", b"").decode(errors="replace")
+        is_file = is_file_url(response_url) or _is_file_content_type(content_type)
+
+        if _is_blocked_content_type(content_type):
+            self.logger.debug(f"Skipping blocked content type {content_type}: {response_url}")
+            self._mark_scrapped(response_url)
+            self._log_periodic_stats()
+            return
 
         if is_file:
             if is_refresh:
@@ -543,29 +703,31 @@ class SiteSpider(scrapy.Spider):
             else:
                 self.crawl_stats["downloaded"] += 1
                 self.crawl_stats["files_downloaded"] += 1
-            self.logger.debug(f"Downloaded file: {response.url}")
+            self.logger.debug(f"Downloaded file: {response_url}")
             yield FileItem(
-                url=response.url,
+                url=response_url,
                 body=response.body,
-                content_type=response.headers.get(b"Content-Type", b"").decode(errors="replace"),
+                content_type=content_type,
                 depth=depth,
                 referer=response.request.headers.get(b"Referer", b"").decode(errors="replace") or None,
                 content_disposition=response.headers.get(b"Content-Disposition", b"").decode(errors="replace") or None,
                 response_headers=dict(response.headers),
             )
+            self._mark_scrapped(response_url)
+            self._log_periodic_stats()
             return
 
         if is_refresh:
             self.crawl_stats["updated"] += 1
-            self.logger.debug(f"Updated cached page: {response.url}")
+            self.logger.debug(f"Updated cached page: {response_url}")
         else:
             self.crawl_stats["downloaded"] += 1
-            self.logger.debug(f"Downloaded new page: {response.url}")
+            self.logger.debug(f"Downloaded new page: {response_url}")
 
         page_item = PageItem(
-            url=response.url,
+            url=response_url,
             body=response.body,
-            content_type=response.headers.get(b"Content-Type", b"").decode(errors="replace"),
+            content_type=content_type,
             depth=depth,
             referer=response.request.headers.get(b"Referer", b"").decode(errors="replace") or None,
             status=response.status,
@@ -575,12 +737,13 @@ class SiteSpider(scrapy.Spider):
 
         async for item in self._process_links(response, depth):
             yield item
-        self._mark_scrapped(response.url)
+        self._mark_scrapped(response_url)
         self._log_periodic_stats()
 
     async def parse_file(self, response: Response):
+        response_url = normalize_url(response.url)
         if response.status == 304:
-            self.logger.debug(f"304 not modified: {response.url}")
+            self.logger.debug(f"304 not modified: {response_url}")
             self._log_periodic_stats()
             return
 
@@ -593,7 +756,7 @@ class SiteSpider(scrapy.Spider):
             self.crawl_stats["files_downloaded"] += 1
 
         yield FileItem(
-            url=response.url,
+            url=response_url,
             body=response.body,
             content_type=response.headers.get(b"Content-Type", b"").decode(errors="replace"),
             depth=depth,
@@ -601,7 +764,7 @@ class SiteSpider(scrapy.Spider):
             content_disposition=response.headers.get(b"Content-Disposition", b"").decode(errors="replace") or None,
             response_headers=dict(response.headers),
         )
-        self._mark_scrapped(response.url)
+        self._mark_scrapped(response_url)
         self._log_periodic_stats()
 
     def closed(self, reason):

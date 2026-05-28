@@ -33,12 +33,21 @@ def url_to_relative_path(url: str, max_bytes: int = 200) -> Path:
 
 def ensure_ext(path: Path, content_type: str) -> Path:
     if not path.suffix:
-        if "html" in content_type:
+        ct = content_type.lower()
+        if "html" in ct:
             path = path.with_suffix(".html")
-        elif "pdf" in content_type:
+        elif "pdf" in ct:
             path = path.with_suffix(".pdf")
-        elif "spreadsheet" in content_type or "excel" in content_type:
+        elif "spreadsheet" in ct or "excel" in ct:
             path = path.with_suffix(".xlsx")
+        elif "zip" in ct:
+            path = path.with_suffix(".zip")
+        elif "powerpoint" in ct or "presentation" in ct:
+            path = path.with_suffix(".pptx")
+        elif "word" in ct or "msword" in ct:
+            path = path.with_suffix(".docx")
+        elif "rar" in ct:
+            path = path.with_suffix(".rar")
     return path
 
 
@@ -53,9 +62,14 @@ def get_orig_name(url: str, content_type: str, final_path: Path) -> str:
     return name
 
 
+_EXT_RE = re.compile(r"^[a-z0-9]+$")
+
+
 def get_extension(path: Path) -> str:
     suffix = path.suffix.lower().lstrip(".")
-    return suffix if suffix else "unknown"
+    if suffix and _EXT_RE.match(suffix):
+        return suffix
+    return "unknown"
 
 
 def get_header(headers: dict, key: bytes, default: str | None = None) -> str | None:
@@ -150,6 +164,7 @@ class FilePipeline:
 
         domain = normalize_domain(urlparse(item["url"]).netloc)
         rel_path = url_to_relative_path(item["url"], max_bytes=self.max_bytes)
+        rel_path = ensure_ext(rel_path, item.get("content_type", ""))
 
         files_dir = self.download_root / domain / "files"
 

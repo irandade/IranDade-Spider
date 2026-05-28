@@ -11,3 +11,4 @@ build/
 *.log
 .idea/
 .vscode/
+docs/superpowers
